@@ -21,6 +21,8 @@ class SequenceState:
             raise ValueError("SequenceState supports exactly one sequence")
         if self.attention_mask.shape[0] != 1:
             raise ValueError("SequenceState supports exactly one sequence")
+        if self.max_new_tokens <= 0:
+            self.finished = True
 
     def append_token(self, token_id: torch.Tensor) -> None:
         self.generated_token_ids = torch.cat([self.generated_token_ids, token_id.unsqueeze(1)], dim=1)

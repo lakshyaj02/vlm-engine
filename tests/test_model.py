@@ -2,6 +2,7 @@ import torch
 from transformers import CLIPVisionConfig, LlamaConfig, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
 from runtime.request import SequenceState
+from runtime.scheduler import Scheduler
 
 from runtime.model import LlavaReferenceModel
 
@@ -186,7 +187,7 @@ def test_request_prefill_and_decode_match_hugging_face_generate() -> None:
     pixel_values = torch.randn(1, 3, 8, 8)
     state = make_sequence_state(input_ids, max_new_tokens=3)
 
-    expected = model.generate(
+    expected = reference.model.generate(
         input_ids=input_ids,
         pixel_values=pixel_values,
         attention_mask=state.attention_mask,
@@ -228,3 +229,110 @@ def test_request_methods_leave_non_generating_state_unchanged() -> None:
     returned_state = reference.decode_request(state)
     assert returned_state is state
     assert state.generated_token_ids.shape == (1, 0)
+
+def test_request_methods_with_non_zero_max_new_tokens() -> None:
+    torch.manual_seed(0)
+    reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
+    input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
+    pixel_values = torch.randn(1, 3, 8, 8)
+    state = make_sequence_state(input_ids, max_new_tokens=2)
+
+    returned_state = reference.prefill_request(state, pixel_values)
+    assert returned_state is state
+    assert state.past_key_values is not None
+    assert state.generated_token_ids.shape == (1, 1)
+    assert state.attention_mask.shape == (1, input_ids.size(1) + 1)
+
+    while state.can_generate_more():
+        returned_state = reference.decode_request(state)
+        assert returned_state is state
+
+    assert state.is_finished()
+    assert state.generated_token_ids.shape == (1, 2)
+    assert state.attention_mask.shape == (1, input_ids.size(1) + 2)
+
+def test_Scheduler_add_request_and_step() -> None:
+    torch.manual_seed(0)
+    reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
+    scheduler = Scheduler(model=reference)
+    input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
+    pixel_values = torch.randn(1, 3, 8, 8)
+    state = make_sequence_state(input_ids, max_new_tokens=2)
+
+    scheduler.add_request(state=state, pixel_values=pixel_values)
+    assert len(scheduler.waiting) == 1
+    assert len(scheduler.running) == 0
+    assert len(scheduler.completed) == 0
+
+    scheduler.step()
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.running) == 1 or len(scheduler.completed) == 1
+
+    while scheduler.has_work():
+        scheduler.step()
+
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.running) == 0
+    assert len(scheduler.completed) == 1
+    assert scheduler.completed[0].is_finished()
+
+def test_Scheduler_handles_multiple_requests() -> None:
+    torch.manual_seed(0)
+    reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
+    scheduler = Scheduler(model=reference)
+    input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
+    pixel_values = torch.randn(1, 3, 8, 8)
+    state1 = make_sequence_state(input_ids, max_new_tokens=2)
+    state2 = make_sequence_state(input_ids, max_new_tokens=2)
+
+    scheduler.add_request(state=state1, pixel_values=pixel_values)
+    scheduler.add_request(state=state2, pixel_values=pixel_values)
+    assert len(scheduler.waiting) == 2
+    assert len(scheduler.running) == 0
+    assert len(scheduler.completed) == 0
+
+    while scheduler.has_work():
+        scheduler.step()
+
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.running) == 0
+    assert len(scheduler.completed) == 2
+    assert all(state.is_finished() for state in scheduler.completed)
+
+def test_scheduler_has_work() -> None:
+    torch.manual_seed(0)
+    reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
+    scheduler = Scheduler(model=reference)
+    input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
+    pixel_values = torch.randn(1, 3, 8, 8)
+    state = make_sequence_state(input_ids, max_new_tokens=2)
+
+    assert not scheduler.has_work()
+
+    scheduler.add_request(state=state, pixel_values=pixel_values)
+    assert scheduler.has_work()
+
+    while scheduler.has_work():
+        scheduler.step()
+
+    assert not scheduler.has_work()
+
+def test_match_hf_token_ids_with_scheduler() -> None:
+    torch.manual_seed(0)
+    input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
+    state = make_sequence_state(input_ids, max_new_tokens=2)
+    reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
+    expected = reference.model.generate(input_ids=input_ids, pixel_values=torch.randn(1, 3, 8, 8),
+                                        attention_mask=torch.ones_like(input_ids),
+                                        max_new_tokens=state.max_new_tokens,
+                                        do_sample=False)
+    scheduler = Scheduler(model=reference)
+    pixel_values = torch.randn(1, 3, 8, 8)
+    scheduler.add_request(state=state, pixel_values=pixel_values)
+    while scheduler.has_work():
+        scheduler.step()
+    assert state.is_finished()
+    torch.testing.assert_close(
+        state.generated_token_ids,
+        expected[:, input_ids.size(1):],
+    )
