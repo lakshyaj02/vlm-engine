@@ -2,7 +2,7 @@ import torch
 from transformers import CLIPVisionConfig, LlamaConfig, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
 from runtime.request import SequenceState
-from runtime.scheduler import Scheduler
+from runtime.scheduler import DecodeBatch, Scheduler
 
 from runtime.model import LlavaReferenceModel
 
@@ -322,12 +322,12 @@ def test_match_hf_token_ids_with_scheduler() -> None:
     input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
     state = make_sequence_state(input_ids, max_new_tokens=2)
     reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
-    expected = reference.model.generate(input_ids=input_ids, pixel_values=torch.randn(1, 3, 8, 8),
+    pixel_values = torch.randn(1, 3, 8, 8)
+    expected = reference.model.generate(input_ids=input_ids, pixel_values=pixel_values,
                                         attention_mask=torch.ones_like(input_ids),
                                         max_new_tokens=state.max_new_tokens,
                                         do_sample=False)
     scheduler = Scheduler(model=reference)
-    pixel_values = torch.randn(1, 3, 8, 8)
     scheduler.add_request(state=state, pixel_values=pixel_values)
     while scheduler.has_work():
         scheduler.step()
@@ -336,3 +336,32 @@ def test_match_hf_token_ids_with_scheduler() -> None:
         state.generated_token_ids,
         expected[:, input_ids.size(1):],
     )
+
+
+def test_decode_batch_build_and_apply_output() -> None:
+    torch.manual_seed(0)
+    reference = LlavaReferenceModel(make_tiny_llava(), processor=None)
+    input_ids = torch.tensor([[1, 31, 31, 31, 31, 4, 5]])
+    pixel_values = torch.randn(1, 3, 8, 8)
+    states = [make_sequence_state(input_ids, max_new_tokens=2) for _ in range(2)]
+
+    for state in states:
+        reference.prefill_request(state, pixel_values)
+
+    batch = DecodeBatch.build_decode_batch(states)
+    assert batch.input_ids.shape == (2, 1)
+    assert batch.attention_mask.shape == (2, input_ids.size(1) + 1)
+    assert all(layer[0].shape[0] == 2 for layer in batch.past_key_values)
+    assert all(layer[1].shape[0] == 2 for layer in batch.past_key_values)
+
+    output = reference.decode_one(
+        next_token_id=batch.input_ids,
+        attention_mask=batch.attention_mask,
+        past_key_values=batch.past_key_values,
+    )
+    batch.apply_decode_output(output)
+
+    assert all(state.is_finished() for state in states)
+    assert all(state.generated_token_ids.shape == (1, 2) for state in states)
+    assert all(layer[0].shape[0] == 1 for state in states for layer in state.past_key_values)
+    assert all(layer[1].shape[0] == 1 for state in states for layer in state.past_key_values)

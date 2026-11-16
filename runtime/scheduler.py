@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from runtime.model import LlavaReferenceModel
 from runtime.request import SequenceState
-
 
 @dataclass
 class PendingRequest:
@@ -53,3 +56,63 @@ class Scheduler:
 
     def has_work(self) -> bool:
         return bool(self.waiting or self.running)
+
+@dataclass
+class DecodeBatch:
+    states: list[SequenceState]
+    input_ids: torch.Tensor       # [batch, 1]
+    attention_mask: torch.Tensor  # [batch, sequence_length]
+    past_key_values: Any
+
+    @classmethod
+    def build_decode_batch(cls, states: list[SequenceState]) -> DecodeBatch:
+        if not states:
+            raise ValueError("No states provided")
+        # Check every state can generate
+        for state in states:
+            if not state.can_generate_more():
+                raise ValueError(f"State {state} cannot generate")
+
+        # Check length
+        seq_lengths = [state.attention_mask.size(1) for state in states]
+        if len(set(seq_lengths)) != 1:
+            raise ValueError("All states must have the same sequence length")
+
+        input_ids = torch.cat([state.next_input_token().unsqueeze(-1) for state in states], dim=0)
+        attention_mask = torch.cat([state.attention_mask for state in states], dim=0)
+
+        cache_type = type(states[0].past_key_values)
+        past_key_values = cache_type.from_legacy_cache(tuple(
+            tuple(
+                torch.cat(
+                    [state.past_key_values[layer][cache_index] for state in states],
+                    dim=0,
+                )
+                for cache_index in range(len(states[0].past_key_values[layer]))
+            )
+            for layer in range(len(states[0].past_key_values))
+        ))
+
+        return DecodeBatch(
+            states=states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+
+    def apply_decode_output(
+        self,
+        output: CausalLMOutputWithPast,
+    ) -> None:
+        next_tokens = output.logits[:, -1, :]  # [batch, vocab_size]
+        next_tokens = next_tokens.argmax(dim=-1)  # [batch]
+        cache_type = type(output.past_key_values)
+        for index, state in enumerate(self.states):
+            state.past_key_values = cache_type.from_legacy_cache(tuple(
+                tuple(
+                    cache_tensor[index : index + 1]
+                    for cache_tensor in output.past_key_values[layer]
+                )
+                for layer in range(len(output.past_key_values))
+            ))
+            state.append_token(next_tokens[index : index + 1])
