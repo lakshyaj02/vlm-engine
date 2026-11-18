@@ -44,12 +44,18 @@ class Scheduler:
             else:
                 new_state = state
 
-        for state in list(self.running):
-            # Decode step for running requests
-            self.model.decode_request(state=state)
-            if state.is_finished():
-                self.running.remove(state)
-                self.completed.append(state)
+        batch = DecodeBatch.build_decode_batch(list(self.running)) if self.running else None
+        if batch is not None:
+            output = self.model.decode_one(
+                next_token_id=batch.input_ids,
+                attention_mask=batch.attention_mask,
+                past_key_values=batch.past_key_values
+            )
+            batch.apply_decode_output(output)
+            for state in list(self.running):
+                if state.is_finished():
+                    self.running.remove(state)
+                    self.completed.append(state)
 
         if new_state is not None:
             self.running.append(new_state)

@@ -365,3 +365,4 @@ def test_decode_batch_build_and_apply_output() -> None:
     assert all(state.generated_token_ids.shape == (1, 2) for state in states)
     assert all(layer[0].shape[0] == 1 for state in states for layer in state.past_key_values)
     assert all(layer[1].shape[0] == 1 for state in states for layer in state.past_key_values)
+
