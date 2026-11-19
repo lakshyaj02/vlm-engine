@@ -44,18 +44,26 @@ class Scheduler:
             else:
                 new_state = state
 
-        batch = DecodeBatch.build_decode_batch(list(self.running)) if self.running else None
-        if batch is not None:
+        # Group running request by same attention mask size
+        groups: dict[int, list[SequenceState]] = {}
+        for state in self.running:
+            seq_len = state.attention_mask.size(1)
+            groups.setdefault(seq_len, []).append(state)
+
+        for states in groups.values():
+            batch = DecodeBatch.build_decode_batch(states)
             output = self.model.decode_one(
-                next_token_id=batch.input_ids,
-                attention_mask=batch.attention_mask,
-                past_key_values=batch.past_key_values
-            )
+                            next_token_id=batch.input_ids,
+                            attention_mask=batch.attention_mask,
+                            past_key_values=batch.past_key_values
+                        )
             batch.apply_decode_output(output)
-            for state in list(self.running):
-                if state.is_finished():
-                    self.running.remove(state)
-                    self.completed.append(state)
+
+
+        for state in list(self.running):
+            if state.is_finished():
+                self.running.remove(state)
+                self.completed.append(state)
 
         if new_state is not None:
             self.running.append(new_state)
