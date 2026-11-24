@@ -22,6 +22,7 @@ class Scheduler:
     waiting: deque[PendingRequest] = field(default_factory=deque)
     running: deque[SequenceState] = field(default_factory=deque)
     completed: deque[SequenceState] = field(default_factory=deque)
+    max_batch_size: int = 8
 
     def add_request(
         self,
